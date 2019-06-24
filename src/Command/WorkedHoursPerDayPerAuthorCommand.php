@@ -4,6 +4,7 @@
 namespace Jpastoor\JiraWorklogExtractor\Command;
 
 use chobie\Jira\Api;
+use chobie\Jira\Issue;
 use Jpastoor\JiraWorklogExtractor\CachedHttpClient;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Helper\ProgressBar;
@@ -98,6 +99,9 @@ class WorkedHoursPerDayPerAuthorCommand extends Command
         $offset = 0;
 
         $worked_time = [];
+        $worked_time_per_issue_per_author = [];
+        $issue_summaries = [];
+        $authors = [];
 
         do {
 
@@ -111,7 +115,7 @@ class WorkedHoursPerDayPerAuthorCommand extends Command
                 $jql .= " and worklogAuthor in (" . $input->getOption("authors-whitelist") . ")";
             }
 
-            $search_result = $jira->search($jql, $offset, self::MAX_ISSUES_PER_QUERY, "key,project,labels");
+            $search_result = $jira->search($jql, $offset, self::MAX_ISSUES_PER_QUERY, "key,project,labels,summary");
 
             if ($progress == null) {
                 /** @var ProgressBar $progress */
@@ -123,12 +127,17 @@ class WorkedHoursPerDayPerAuthorCommand extends Command
             $issues = $search_result->getIssues();
             foreach ($issues as $issue) {
 
-                $worklog_result = $jira->getWorklogs($issue->getKey(), []);
+                /* @var Issue $issue */
+                $issue_summaries[$issue->getKey()] = $issue->getSummary();
+                $worklog_result = $jira->getWorklogs($issue->getKey(), ['expand' => 'properties']);
 
                 $worklog_array = $worklog_result->getResult();
                 if (isset($worklog_array["worklogs"]) && !empty($worklog_array["worklogs"])) {
                     foreach ($worklog_array["worklogs"] as $entry) {
                         $author = $entry["author"]["key"];
+                        if (!in_array($author, $authors)) {
+                            $authors[] = $author;
+                        }
 
                         // Filter on author
                         if ($input->getOption("authors-whitelist")) {
@@ -147,6 +156,7 @@ class WorkedHoursPerDayPerAuthorCommand extends Command
                         }
 
                         @$worked_time[$author][$worklog_date->format("Y-m-d")] += $entry["timeSpentSeconds"] / 60;
+                        @$worked_time_per_issue_per_author[$issue->getKey()][$author] += $entry["timeSpentSeconds"] / 60;
                     }
                 }
                 $progress->advance();
@@ -185,7 +195,7 @@ class WorkedHoursPerDayPerAuthorCommand extends Command
 
         $totals_row = [""];
         for ($i = 1; $i < count($sheet_headers); $i++) {
-            $totals_row[] = "=ROUND(SUM(" . XLSXWriter::xlsCell(2, $i) . ":" . XLSXWriter::xlsCell(10000, $i) . ")/60,0)";
+            $totals_row[] = "=SUM(" . XLSXWriter::xlsCell(2, $i) . ":" . XLSXWriter::xlsCell(10000, $i) . ")";
         }
         $writer->writeSheetRow("sheet1", $totals_row);
 
@@ -193,6 +203,18 @@ class WorkedHoursPerDayPerAuthorCommand extends Command
             $writer->writeSheetRow("sheet1", $row);
         }
 
+        foreach ($worked_time_per_issue_per_author as $issueKey => $hoursPerAuthor) {
+            $row = array_pad($row, 2 + count($authors), 0);
+            $row[0] = $issueKey;
+            $row[1] = $issue_summaries[$issueKey];
+
+            foreach ($hoursPerAuthor as $author => $hours) {
+                $row[2 + array_search($author, $authors)] = "={$hours}/60";
+            }
+
+            $writer->writeSheetRow("sheet2", $row);
+            $row = [];
+        }
 
         $writer->writeToFile($input->getOption("output-file"));
     }
@@ -222,6 +244,13 @@ class WorkedHoursPerDayPerAuthorCommand extends Command
                 $sheet_data_by_date[$date][$unique_authors_map[$author] + 1] += $value;
             }
         }
+
+        $sheet_data_by_date = array_map(function ($value) {
+            for ($i = 1; $i < count($value); $i++) {
+                if ($value[$i] > 0) $value[$i] = "={$value[$i]}/60";
+            }
+            return $value;
+        }, $sheet_data_by_date);
 
         ksort($sheet_data_by_date);
 
